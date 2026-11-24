@@ -45,11 +45,13 @@
   .hl.ltr { direction:ltr; unicode-bidi:isolate; display:inline-block; }
   mark { background:#ffe066; border-radius:3px; }
   #search { width:100%; padding:10px 12px; font-size:16px; border:1px solid #ccd; border-radius:10px; margin-bottom:10px; background:#fff; }
+  .usage { font-size:12px; opacity:.85; margin-inline-start:auto; margin-inline-end:6px; }
 </style>
 </head>
 <body>
 <header>
   <h1>🎙️ תמלול</h1>
+  <span id="usage" class="usage"></span>
   <button id="settingsBtn" aria-label="הגדרות">⚙️</button>
 </header>
 <main>
@@ -61,6 +63,8 @@
     <label for="model">מודל</label>
     <select id="model"><option value="auto">אוטומטי (מומלץ)</option></select>
     <p class="muted" id="modelHint">"אוטומטי" בוחר לבד את המודל המהיר שעובד. אפשר לבחור מודל ספציפי כדי להשוות מהירות ואיכות; המהירות מוצגת בשורה הקטנה מתחת לכל תמליל.</p>
+    <label>שימוש במכסה</label>
+    <div class="muted" id="usageDetails" style="font-size:13px"></div>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="saveBtn">שמירה</button>
       <button class="btn light" id="closeBtn">סגירה</button>
@@ -92,17 +96,55 @@
 </main>
 
 <script>
+// ---------- daily request counter (shared by "תמלול" and "רשמתי": same site → same Google quota) ----------
+// Google resets the daily quota at midnight Pacific time (10:00 in Israel) and doesn't report what's left,
+// so we count the requests ourselves; when a daily-quota error arrives we remember after how many it happened.
+const pacificDay = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(new Date());
+function usage() {
+  let u; try { u = JSON.parse(localStorage.getItem('gemini-usage')); } catch {}
+  return u && u.day === pacificDay() ? u : { day: pacificDay(), count: 0, models: {} };
+}
+function knownLimits() { try { return JSON.parse(localStorage.getItem('gemini-limits')) || {}; } catch { return {}; } }
+function countRequest(model) {
+  const u = usage(); u.count++; u.models[model] = (u.models[model] || 0) + 1;
+  try { localStorage.setItem('gemini-usage', JSON.stringify(u)); } catch {}
+  renderUsage();
+}
+function noteDailyLimit(model) {
+  const n = usage().models[model]; if (!n) return;
+  const l = knownLimits(); l[model] = { n, day: pacificDay() };
+  try { localStorage.setItem('gemini-limits', JSON.stringify(l)); } catch {}
+  renderUsage();
+}
+function renderUsage() {
+  const u = usage(), b = document.getElementById('usage'), d = document.getElementById('usageDetails');
+  if (b) { b.textContent = u.count ? `היום: ${u.count} בקשות` : ''; b.title = 'נספר בשתי האפליקציות; מתאפס ב-10:00'; }
+  if (!d) return;
+  const lim = knownLimits(), names = [...new Set([...Object.keys(u.models), ...Object.keys(lim)])];
+  d.innerHTML = '';
+  if (!names.length) { d.textContent = 'עוד לא נשלחו בקשות היום.'; return; }
+  const top = document.createElement('div'); top.textContent = `סה"כ היום (בשתי האפליקציות): ${u.count}. מתאפס כל יום ב-10:00.`; d.append(top);
+  for (const m of names) {
+    const row = document.createElement('div'); row.style.direction = 'ltr'; row.style.textAlign = 'left';
+    row.textContent = `${m}: ${u.models[m] || 0}` + (lim[m] ? ` / ~${lim[m].n} (daily limit measured ${lim[m].day})` : '');
+    d.append(row);
+  }
+}
+window.addEventListener('storage', e => { if (e.key === 'gemini-usage' || e.key === 'gemini-limits') renderUsage(); });
+
 const DEFAULT_MODEL = 'auto';   // auto = pick the newest available Flash model from the API's model list
 const OLD_DEFAULTS = ['gemini-flash-latest', 'gemini-2.5-flash', ''];
 const SYSTEM = 'אתה מתמלל הודעות קוליות מוואטסאפ. אתה כותב בדיוק את מה שנאמר, בשפה שבה נאמר. ' +
   'ההודעות כמעט תמיד בעברית, ואז התמליל חייב להיות כתוב באותיות עבריות. לעולם אל תתרגם לאנגלית.';
-const PROMPT = 'תמלל את ההודעה הקולית המצורפת מילה במילה, בעברית (או בשפה שבה הדובר באמת מדבר). ' +
+const PROMPT_BASE = 'תמלל את ההודעה הקולית המצורפת מילה במילה, בעברית (או בשפה שבה הדובר באמת מדבר). ' +
   'אסור לתרגם ואסור לסכם. הוסף פיסוק וחלוקה לפסקאות כדי שיהיה נוח לקרוא. ' +
   'החזר רק את התמליל עצמו, בלי הקדמה ובלי הערות. גם אם ההקלטה שקטה או לא ברורה, תמלל כל מה שאפשר לשמוע. ' +
-  'רק אם אין בהקלטה דיבור בכלל, החזר בדיוק: [לא זוהה דיבור]';
-const RETRY_PROMPT = 'התמליל הקודם שלך יצא באנגלית, כנראה בטעות תרגמת. האזן שוב להקלטה. ' +
-  'אם הדובר מדבר עברית, כתוב את מה שהוא אומר מילה במילה באותיות עבריות. ' +
-  'רק אם הדובר באמת מדבר אנגלית, החזר את התמליל באנגלית. החזר רק את התמליל.';
+  'רק אם אין בהקלטה דיבור בכלל, החזר בדיוק: [לא זוהה דיבור]. ';
+const FORMAT = 'פורמט התשובה: בשורה הראשונה רק קוד השפה שהדובר מדבר בה בפועל, בסוגריים מרובעים — [he] לעברית, [en] לאנגלית וכו\'. מהשורה השנייה: התמליל. ' +
+  'אם ההודעה ארוכה (בערך 45 שניות דיבור או יותר), הוסף בסוף שורה שמתחילה ב-"###סיכום:" ואחריה סיכום בעברית של משפט או שניים: מה רוצים, מה חשוב, תאריכים ושעות. בהודעה קצרה — בלי סיכום.';
+const PROMPT = PROMPT_BASE + FORMAT;
+const RETRY_PROMPT = 'התמליל הקודם שלך יצא באנגלית למרות שסימנת שהדובר מדבר עברית — כנראה בטעות תרגמת. האזן שוב להקלטה ' +
+  'וכתוב את מה שנאמר מילה במילה באותיות עבריות. ' + FORMAT;
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -113,7 +155,9 @@ const store = {
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 
 // ---------- settings ----------
+renderUsage();
 function openSettings() {
+  renderUsage();
   $('key').value = store.get('apiKey', '');
   $('settings').classList.remove('hidden');
   fillModelSelect();
@@ -397,6 +441,7 @@ async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = 
   signal?.addEventListener('abort', onParentAbort);
   arm(TIMEOUT_MS);                                   // time allowed until the first words arrive
   try {
+    countRequest(model);
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
       signal: ctrl.signal,
       method: 'POST',
@@ -453,22 +498,13 @@ const STALL_MS = 20000;     // max silence between words once streaming
 // WhatsApp names voice notes like PTT-20261124-WA0012.opus → name order = the order they were sent.
 function sortFiles(fs) { return fs.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })); }
 const MAX_AUTO_RETRIES = 2;
-const SUMMARY_MIN_CHARS = 450;   // about 45+ seconds of speech
-async function summarize(text, model, key) {
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: 'סכם בעברית, במשפט אחד או שניים קצרים, את עיקר ההודעה הבאה: מה רוצים ממני, מה חשוב, תאריכים ושעות אם יש. ' +
-          'כתוב רק את הסיכום, בלי הקדמה.\n\n' + text }] }],
-        generationConfig: /gemini-3/.test(model) ? { thinkingConfig: { thinkingLevel: 'minimal' } } : { temperature: 0 }
-      })
-    });
-    if (!r.ok) return null;
-    const j = await r.json();
-    return (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim() || null;
-  } catch { return null; }
+function parseOut(raw, partial = false) {
+  let lang = '', s = raw;
+  s = s.replace(partial ? /^\s*\[[a-z]{0,3}\]?\s*/i : /^\s*\[([a-z]{2,3})\]\s*/i, (m, l) => { lang = (l || '').toLowerCase(); return ''; });
+  let summary = '';
+  const k = s.indexOf(partial ? '###' : '###סיכום');
+  if (k >= 0) { summary = s.slice(k).replace(/^###סיכום:?\s*/, '').trim(); s = s.slice(0, k); }
+  return { lang, text: s.trim(), summary };
 }
 const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
@@ -538,6 +574,7 @@ async function transcribeOne(file, label) {
         if (!e.cancelled) {
           diag.push(`${model} (${Math.round((Date.now() - ts) / 1000)}s): ${e.status ? e.status + ' ' : ''}${String(e.message).slice(0, 120)}`);
           if (/no longer available|not found|not supported|deprecated/i.test(e.message) && (e.status === 404 || e.status === 400)) markBad(model);
+          if (e.status === 429 && e.daily) noteDailyLimit(model);
           if (e.status === 429) coolDown(model, e.daily ? 360 : Math.max(1, (e.retryAfter || 60) / 60));
           else if (e.timeout) coolDown(model, 5);
         }
@@ -561,7 +598,7 @@ async function transcribeOne(file, label) {
         liveText = el('div', 'transcript'); liveCard.append(liveText);
         $('current').append(liveCard); $('current').classList.remove('hidden');
       }
-      liveText.textContent = t;
+      liveText.textContent = parseOut(t, true).text;
     };
     const unlive = () => { liveCard?.remove(); liveText = liveCard = null; if (!$('current').children.length) $('current').classList.add('hidden'); };
 
@@ -590,13 +627,17 @@ async function transcribeOne(file, label) {
         if (queue.length) showProgress([queue[0]]);
       }
     }
+    let summary = '';
     if (text) {
       store.set('lastGoodModel', usedModel);
-      if (!hasHebrew(text) && /[a-z]{3}/i.test(text)) {    // came back in English → ask again in Hebrew
+      let out = parseOut(text);
+      // Only re-ask if the model itself said the speaker speaks Hebrew (or gave no tag) but wrote English.
+      if (!hasHebrew(out.text) && /[a-z]{3}/i.test(out.text) && (out.lang === 'he' || !out.lang)) {
         unlive();
         status('<div class="spinner"></div>מוודא שהתמליל בעברית...');
-        try { text = await callGemini(usedModel, key, mime, data, { prompt: RETRY_PROMPT, onText: live }); } catch {}
+        try { out = parseOut(await callGemini(usedModel, key, mime, data, { prompt: RETRY_PROMPT, onText: live })); } catch {}
       }
+      text = out.text || text; summary = out.summary;
     }
     const secs = Math.round((Date.now() - t0) / 1000);
     clearInterval(window._tick);
@@ -614,7 +655,7 @@ async function transcribeOne(file, label) {
     }
     hideStatus();
     if (!liveCard) live(text);                       // (in case nothing streamed)
-    const item = { text, ts: Math.max(Date.now(), (loadHistory()[0]?.ts || 0) + 1), info: `${usedModel} · ${secs}s · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
+    const item = { text, summary, ts: Math.max(Date.now(), (loadHistory()[0]?.ts || 0) + 1), info: `${usedModel} · ${secs}s · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
     let audioNote = '';
     try {
@@ -625,13 +666,6 @@ async function transcribeOne(file, label) {
     } catch (err) { audioNote = 'audio not saved: ' + (err?.name || '') + ' ' + (err?.message || err); }
     if (audioNote) { item.info += ' · ' + audioNote; updateItem(item.ts, { info: item.info }); }
     const card = placeCard(item, liveCard);
-    if (text.length > SUMMARY_MIN_CHARS) {
-      summarize(text, usedModel, key).then(s => {
-        if (!s) return;
-        item.summary = s; updateItem(item.ts, { summary: s });
-        if (card.isConnected) card._setSummary(s);
-      });
-    }
   }
 }
 
