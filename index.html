@@ -190,29 +190,46 @@ function toBase64(blob) {
     r.readAsDataURL(blob);
   });
 }
-async function callGemini(model, key, mime, data, prompt = PROMPT, useThinking = true) {
+async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = true, signal } = {}) {
   const gen = {};
-  if (/gemini-3/.test(model)) { if (useThinking) gen.thinkingConfig = { thinkingLevel: 'low' }; }  // faster
+  if (/gemini-3/.test(model)) { if (thinking) gen.thinkingConfig = { thinkingLevel: 'minimal' }; }  // fastest
   else gen.temperature = 0;
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: SYSTEM }] },
-      contents: [{ parts: [{ inline_data: { mime_type: mime, data } }, { text: prompt }] }],
-      generationConfig: gen
-    })
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) {
-    if (r.status === 400 && useThinking && gen.thinkingConfig && /think/i.test(j.error?.message || ''))
-      return callGemini(model, key, mime, data, prompt, false);
-    const e = new Error(j.error?.message || ('HTTP ' + r.status)); e.status = r.status; throw e;
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, TIMEOUT_MS);
+  const onParentAbort = () => ctrl.abort();
+  signal?.addEventListener('abort', onParentAbort);
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      signal: ctrl.signal,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ parts: [{ inline_data: { mime_type: mime, data } }, { text: prompt }] }],
+        generationConfig: gen
+      })
+    });
+    const j = await r.json();
+    if (!r.ok) {
+      if (r.status === 400 && thinking && gen.thinkingConfig && /think/i.test(j.error?.message || ''))
+        return await callGemini(model, key, mime, data, { prompt, thinking: false, signal });
+      throw Object.assign(new Error(j.error?.message || ('HTTP ' + r.status)), { status: r.status });
+    }
+    const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
+    if (!text) throw new Error('empty response (' + (j.candidates?.[0]?.finishReason || 'unknown') + ')');
+    return text;
+  } catch (err) {
+    if (err.name === 'AbortError')
+      throw Object.assign(new Error(timedOut ? `timeout after ${TIMEOUT_MS/1000}s (${model})` : 'cancelled'),
+                          { status: timedOut ? 504 : 0, timeout: timedOut, cancelled: !timedOut });
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onParentAbort);
   }
-  const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
-  if (!text) throw new Error('התקבלה תשובה ריקה');
-  return text;
 }
+const TIMEOUT_MS = 45000;   // long voice messages need time; parallel racing covers slow models
 const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
 // Ask the API which models this key can use, so retired model names don't break the app.
@@ -240,7 +257,8 @@ async function candidateModels(key, chosen) {
     } catch {}
   }
   if (!list.length) list = ['gemini-flash-latest', 'gemini-pro-latest'];
-  return [...new Set([...manual, ...list])];
+  const last = store.get('lastGoodModel', '');
+  return [...new Set([...manual, ...(last ? [last] : []), ...list])];
 }
 
 async function transcribe(file) {
@@ -261,35 +279,56 @@ async function transcribe(file) {
     if (OLD_DEFAULTS.includes(chosen)) { chosen = DEFAULT_MODEL; store.set('model', chosen); }
     const models = await candidateModels(key, chosen);
     const isKeyError = e => e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message));
-    const busy = s => s === 429 || s >= 500;
-    let text, lastErr, usedModel;
-    outer:
-    for (const model of models) {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          status(`<div class="spinner"></div>מתמלל...<div class="muted" style="direction:ltr">${model}</div>`);
-          text = await callGemini(model, key, mime, data); usedModel = model;
-          if (!hasHebrew(text) && /[a-z]{3}/i.test(text)) {          // came back in English → ask again in Hebrew
-            status(`<div class="spinner"></div>מוודא שהתמליל בעברית...`);
-            try { text = await callGemini(model, key, mime, data, RETRY_PROMPT); } catch {}
-          }
-          break outer;
-        }
-        catch (e) {
-          lastErr = e;
-          if (isKeyError(e)) throw e;
-          if (!busy(e.status) || attempt === 1) break;   // unavailable model or still busy → next model
-          status('<div class="spinner"></div>השרת עמוס, מנסה שוב...');
-          await new Promise(r => setTimeout(r, 2500));
-        }
+    const busy = e => e.status === 429 || (e.status >= 500 && !e.timeout);
+
+    // One model, with a single retry if the server says it's busy.
+    async function runModel(model, signal) {
+      try { return await callGemini(model, key, mime, data, { signal }); }
+      catch (e) {
+        if (!busy(e) || signal?.aborted) throw e;
+        await new Promise(r => setTimeout(r, 2000));
+        return await callGemini(model, key, mime, data, { signal });
       }
     }
+
+    const t0 = Date.now();
+    const showProgress = names => status(`<div class="spinner"></div>מתמלל... <span id="secs">${Math.round((Date.now() - t0) / 1000)}</span> שנ׳<div class="muted" style="direction:ltr">${names.join(' / ')}</div>`);
+    clearInterval(window._tick);
+    window._tick = setInterval(() => { const s = $('secs'); if (s) s.textContent = Math.round((Date.now() - t0) / 1000); }, 1000);
+
+    let text, lastErr, usedModel;
+    // Race the first two candidate models in parallel; take whichever answers first.
+    const queue = [...models];
+    while (!text && queue.length) {
+      const batch = queue.splice(0, queue.length === models.length ? 2 : 1);
+      showProgress(batch);
+      const ctrl = new AbortController();
+      try {
+        [text, usedModel] = await Promise.any(batch.map(m => runModel(m, ctrl.signal).then(t => [t, m])));
+        ctrl.abort();                                    // cancel the slower request
+      } catch (agg) {
+        const errs = (agg.errors || [agg]).filter(e => !e.cancelled);
+        const keyErr = errs.find(isKeyError);
+        if (keyErr) throw keyErr;
+        lastErr = errs[errs.length - 1] || lastErr;
+        if (batch.includes(store.get('lastGoodModel', ''))) store.set('lastGoodModel', '');
+      }
+    }
+    if (text) {
+      store.set('lastGoodModel', usedModel);
+      if (!hasHebrew(text) && /[a-z]{3}/i.test(text)) {    // came back in English → ask again in Hebrew
+        status('<div class="spinner"></div>מוודא שהתמליל בעברית...');
+        try { text = await callGemini(usedModel, key, mime, data, { prompt: RETRY_PROMPT }); } catch {}
+      }
+    }
+    clearInterval(window._tick);
     if (!text) throw lastErr;
     hideStatus();
     const item = { text, ts: Date.now(), info: `${usedModel} · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
     showCurrent(item);
   } catch (e) {
+    clearInterval(window._tick);
     pendingFile = file;
     const friendly =
       (e.status === 400 && /api key/i.test(e.message)) || e.status === 401 || e.status === 403 ? 'בעיה במפתח ה-API. בדקו אותו בהגדרות (⚙️).' :

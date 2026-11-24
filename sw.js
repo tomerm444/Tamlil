@@ -1,5 +1,5 @@
 // Service worker: receives audio shared from WhatsApp and hands it to the page.
-const VERSION = 'v6';
+const VERSION = 'v8';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -34,9 +34,18 @@ self.addEventListener('fetch', e => {
     })());
     return;
   }
+  // App files: answer instantly from the phone's cache, refresh the cache in the background.
+  // (A new version uploaded to GitHub shows up from the next launch.)
   if (e.request.method === 'GET' && url.origin === location.origin) {
-    e.respondWith(
-      fetch(e.request).catch(() => caches.match(e.request, { ignoreSearch: true }))
-    );
+    e.respondWith((async () => {
+      const cache = await caches.open('shell-' + VERSION);
+      const cached = await cache.match(e.request, { ignoreSearch: true });
+      const fresh = fetch(e.request).then(r => {
+        if (r.ok) cache.put(e.request.url.split('?')[0], r.clone());
+        return r;
+      }).catch(() => null);
+      if (cached) { e.waitUntil(fresh); return cached; }
+      return (await fresh) || new Response('offline', { status: 503 });
+    })());
   }
 });
