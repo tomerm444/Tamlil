@@ -31,6 +31,9 @@
   .muted { color:var(--muted); font-size:14px; line-height:1.5; }
   h2 { font-size:16px; color:var(--muted); margin:20px 4px 8px; }
   a { color:var(--green); }
+  .titlebar { display:flex; align-items:center; gap:6px; margin-bottom:8px; font-size:15px; color:var(--green); }
+  .titlebar b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .icon { background:none; border:0; font-size:16px; padding:2px 6px; opacity:.7; }
 </style>
 </head>
 <body>
@@ -56,6 +59,7 @@
   <section id="status" class="card center hidden"></section>
 
   <section id="current" class="card hidden">
+    <div class="titlebar"><b id="currentTitle"></b><button class="icon" id="renameCurrent" aria-label="שינוי שם">✏️</button></div>
     <div class="transcript" id="currentText"></div>
     <div class="meta">
       <span id="currentTime"></span>
@@ -86,10 +90,15 @@
 <script>
 const DEFAULT_MODEL = 'auto';   // auto = pick the newest available Flash model from the API's model list
 const OLD_DEFAULTS = ['gemini-flash-latest', 'gemini-2.5-flash', ''];
-const PROMPT = 'Transcribe this voice message word for word, in its original spoken language (usually Hebrew), using that language\'s own script. ' +
-  'Do NOT translate and do NOT summarize. Add punctuation and paragraph breaks for readability. ' +
-  'Output only the transcript, with no introduction or commentary. Even if the audio is quiet, noisy or unclear, transcribe whatever you can hear; ' +
-  'only if the audio is truly silent or contains no speech at all, output exactly: [לא זוהה דיבור]';
+const SYSTEM = 'אתה מתמלל הודעות קוליות מוואטסאפ. אתה כותב בדיוק את מה שנאמר, בשפה שבה נאמר. ' +
+  'ההודעות כמעט תמיד בעברית, ואז התמליל חייב להיות כתוב באותיות עבריות. לעולם אל תתרגם לאנגלית.';
+const PROMPT = 'תמלל את ההודעה הקולית המצורפת מילה במילה, בעברית (או בשפה שבה הדובר באמת מדבר). ' +
+  'אסור לתרגם ואסור לסכם. הוסף פיסוק וחלוקה לפסקאות כדי שיהיה נוח לקרוא. ' +
+  'החזר רק את התמליל עצמו, בלי הקדמה ובלי הערות. גם אם ההקלטה שקטה או לא ברורה, תמלל כל מה שאפשר לשמוע. ' +
+  'רק אם אין בהקלטה דיבור בכלל, החזר בדיוק: [לא זוהה דיבור]';
+const RETRY_PROMPT = 'התמליל הקודם שלך יצא באנגלית, כנראה בטעות תרגמת. האזן שוב להקלטה. ' +
+  'אם הדובר מדבר עברית, כתוב את מה שהוא אומר מילה במילה באותיות עבריות. ' +
+  'רק אם הדובר באמת מדבר אנגלית, החזר את התמליל באנגלית. החזר רק את התמליל.';
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -128,6 +137,11 @@ function renderHistory(skipFirst) {
   $('histTitle').classList.toggle('hidden', !h.length);
   for (const item of h) {
     const c = document.createElement('div'); c.className = 'card';
+    const tb = document.createElement('div'); tb.className = 'titlebar';
+    const tt = document.createElement('b'); tt.textContent = titleOf(item);
+    const e = document.createElement('button'); e.className = 'icon'; e.textContent = '✏️'; e.setAttribute('aria-label', 'שינוי שם');
+    e.onclick = () => { if (renameItem(item)) tt.textContent = titleOf(item); };
+    tb.append(tt, e); c.append(tb);
     const t = document.createElement('div'); t.className = 'transcript'; t.style.fontSize = '17px'; t.textContent = item.text;
     const m = document.createElement('div'); m.className = 'meta';
     const s = document.createElement('span'); s.textContent = fmt(item.ts);
@@ -138,6 +152,14 @@ function renderHistory(skipFirst) {
     const g = document.createElement('div'); g.className = 'row'; g.append(b, d);
     m.append(s, g); c.append(t, m); $('history').append(c);
   }
+}
+function titleOf(item) { return item.title || 'הודעה קולית'; }
+function renameItem(item) {
+  const name = prompt('שם לתמלול:', item.title || '');
+  if (name === null) return false;
+  item.title = name.trim();
+  saveHistory(loadHistory().map(x => x.ts === item.ts ? { ...x, title: item.title } : x));
+  return true;
 }
 function deleteItem(ts) { saveHistory(loadHistory().filter(x => x.ts !== ts)); }
 $('clearAll').onclick = () => {
@@ -168,21 +190,30 @@ function toBase64(blob) {
     r.readAsDataURL(blob);
   });
 }
-async function callGemini(model, key, mime, data) {
+async function callGemini(model, key, mime, data, prompt = PROMPT, useThinking = true) {
+  const gen = {};
+  if (/gemini-3/.test(model)) { if (useThinking) gen.thinkingConfig = { thinkingLevel: 'low' }; }  // faster
+  else gen.temperature = 0;
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: mime, data } }] }],
-      generationConfig: { temperature: 0 }
+      system_instruction: { parts: [{ text: SYSTEM }] },
+      contents: [{ parts: [{ inline_data: { mime_type: mime, data } }, { text: prompt }] }],
+      generationConfig: gen
     })
   });
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) { const e = new Error(j.error?.message || ('HTTP ' + r.status)); e.status = r.status; throw e; }
-  const text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+  if (!r.ok) {
+    if (r.status === 400 && useThinking && gen.thinkingConfig && /think/i.test(j.error?.message || ''))
+      return callGemini(model, key, mime, data, prompt, false);
+    const e = new Error(j.error?.message || ('HTTP ' + r.status)); e.status = r.status; throw e;
+  }
+  const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
   if (!text) throw new Error('התקבלה תשובה ריקה');
   return text;
 }
+const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
 // Ask the API which models this key can use, so retired model names don't break the app.
 async function candidateModels(key, chosen) {
@@ -235,7 +266,15 @@ async function transcribe(file) {
     outer:
     for (const model of models) {
       for (let attempt = 0; attempt < 2; attempt++) {
-        try { text = await callGemini(model, key, mime, data); usedModel = model; break outer; }
+        try {
+          status(`<div class="spinner"></div>מתמלל...<div class="muted" style="direction:ltr">${model}</div>`);
+          text = await callGemini(model, key, mime, data); usedModel = model;
+          if (!hasHebrew(text) && /[a-z]{3}/i.test(text)) {          // came back in English → ask again in Hebrew
+            status(`<div class="spinner"></div>מוודא שהתמליל בעברית...`);
+            try { text = await callGemini(model, key, mime, data, RETRY_PROMPT); } catch {}
+          }
+          break outer;
+        }
         catch (e) {
           lastErr = e;
           if (isKeyError(e)) throw e;
@@ -265,6 +304,8 @@ async function transcribe(file) {
 }
 function showCurrent(item) {
   $('currentText').textContent = item.text;
+  $('currentTitle').textContent = titleOf(item);
+  $('renameCurrent').onclick = () => { if (renameItem(item)) $('currentTitle').textContent = titleOf(item); };
   $('currentTime').textContent = fmt(item.ts);
   $('currentInfo').textContent = item.info || '';
   $('current').classList.remove('hidden');
