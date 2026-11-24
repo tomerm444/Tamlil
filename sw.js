@@ -1,5 +1,5 @@
 // Service worker: receives audio shared from WhatsApp and hands it to the page.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
