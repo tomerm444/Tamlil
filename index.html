@@ -123,6 +123,7 @@ $('saveBtn').onclick = () => {
   store.set('apiKey', $('key').value.trim());
   store.set('model', $('model').value.trim() || DEFAULT_MODEL);
   store.set('modelList', '');
+  store.set('badModels', '[]');
   $('settings').classList.add('hidden');
   if (pendingFile) { const f = pendingFile; pendingFile = null; transcribe(f); }
 };
@@ -232,6 +233,8 @@ async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = 
 const TIMEOUT_MS = 45000;   // long voice messages need time; parallel racing covers slow models
 const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
+function badModels() { try { return JSON.parse(store.get('badModels', '[]')); } catch { return []; } }
+function markBad(m) { const b = badModels(); if (!b.includes(m)) { b.push(m); store.set('badModels', JSON.stringify(b)); } }
 // Ask the API which models this key can use, so retired model names don't break the app.
 async function candidateModels(key, chosen) {
   const manual = chosen && chosen !== 'auto' ? [chosen] : [];
@@ -258,7 +261,8 @@ async function candidateModels(key, chosen) {
   }
   if (!list.length) list = ['gemini-flash-latest', 'gemini-pro-latest'];
   const last = store.get('lastGoodModel', '');
-  return [...new Set([...manual, ...(last ? [last] : []), ...list])];
+  const bad = badModels();
+  return [...new Set([...manual, ...(last ? [last] : []), ...list])].filter(m => manual.includes(m) || !bad.includes(m));
 }
 
 async function transcribe(file) {
@@ -282,12 +286,22 @@ async function transcribe(file) {
     const busy = e => e.status === 429 || (e.status >= 500 && !e.timeout);
 
     // One model, with a single retry if the server says it's busy.
+    const diag = [];
     async function runModel(model, signal) {
-      try { return await callGemini(model, key, mime, data, { signal }); }
-      catch (e) {
-        if (!busy(e) || signal?.aborted) throw e;
-        await new Promise(r => setTimeout(r, 2000));
-        return await callGemini(model, key, mime, data, { signal });
+      const ts = Date.now();
+      try {
+        try { return await callGemini(model, key, mime, data, { signal }); }
+        catch (e) {
+          if (!busy(e) || signal?.aborted) throw e;
+          await new Promise(r => setTimeout(r, 2000));
+          return await callGemini(model, key, mime, data, { signal });
+        }
+      } catch (e) {
+        if (!e.cancelled) {
+          diag.push(`${model} (${Math.round((Date.now() - ts) / 1000)}s): ${e.status ? e.status + ' ' : ''}${String(e.message).slice(0, 120)}`);
+          if (/no longer available|not found|not supported|deprecated/i.test(e.message) && (e.status === 404 || e.status === 400)) markBad(model);
+        }
+        throw e;
       }
     }
 
@@ -322,7 +336,7 @@ async function transcribe(file) {
       }
     }
     clearInterval(window._tick);
-    if (!text) throw lastErr;
+    if (!text) { if (lastErr) lastErr.diag = diag; throw lastErr || new Error('no models'); }
     hideStatus();
     const item = { text, ts: Date.now(), info: `${usedModel} · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
@@ -336,7 +350,7 @@ async function transcribe(file) {
       e.status >= 500 ? 'השרתים של גוגל עמוסים כרגע. נסו שוב בעוד דקה.' :
       e.status === -1 ? 'הקובץ שהתקבל מוואטסאפ ריק. נסו לשתף שוב.' :
       !e.status ? 'אין חיבור לאינטרנט, או שהבקשה נכשלה.' : 'התמלול נכשל.';
-    status(`<div class="err">${friendly}</div><div class="muted" style="direction:ltr;margin-top:6px">${String(e.message).replace(/</g,'&lt;')}</div>
+    status(`<div class="err">${friendly}</div><div class="muted" style="direction:ltr;text-align:left;margin-top:6px;font-size:12px">${(e.diag && e.diag.length ? e.diag : [String(e.message)]).map(s => s.replace(/</g,'&lt;')).join('<br>')}</div>
       <div class="row" style="justify-content:center;margin-top:10px"><button class="btn" id="retryBtn">נסה שוב</button></div>`);
     $('retryBtn').onclick = () => { const f = pendingFile; pendingFile = null; transcribe(f); };
   }
