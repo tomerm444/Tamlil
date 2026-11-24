@@ -144,7 +144,7 @@ const idb = (() => {
     t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error);
   }); };
   return {
-    put: (k, v) => tx('readwrite', s => s.put(v, k)).catch(() => {}),
+    put: (k, v) => tx('readwrite', s => s.put(v, k)),   // caller handles errors
     get: k => tx('readonly', s => s.get(k)).catch(() => null),
     del: k => tx('readwrite', s => s.delete(k)).catch(() => {}),
     keys: () => tx('readonly', s => s.getAllKeys()).catch(() => []),
@@ -570,7 +570,14 @@ async function transcribeOne(file, label) {
     if (!liveCard) live(text);                       // (in case nothing streamed)
     const item = { text, ts: Math.max(Date.now(), (loadHistory()[0]?.ts || 0) + 1), info: `${usedModel} · ${secs}s · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
-    await idb.put(item.ts, file);
+    let audioNote = '';
+    try {
+      const copy = new Blob([await file.arrayBuffer()], { type: mime });   // plain in-memory copy
+      try { await idb.put(item.ts, copy); }
+      catch { await new Promise(r => setTimeout(r, 300)); await idb.put(item.ts, copy); }
+      if (!(await idb.get(item.ts))) audioNote = 'audio: not found after save';
+    } catch (err) { audioNote = 'audio not saved: ' + (err?.name || '') + ' ' + (err?.message || err); }
+    if (audioNote) { item.info += ' · ' + audioNote; updateItem(item.ts, { info: item.info }); }
     const card = placeCard(item, liveCard);
     if (text.length > SUMMARY_MIN_CHARS) {
       summarize(text, usedModel, key).then(s => {
@@ -627,9 +634,9 @@ $('filePick').onchange = e => { const fs = [...e.target.files]; if (fs.length) t
     const files = [];
     for (const req of await cache.keys()) {
       const resp = await cache.match(req);
-      const blob = await resp.blob();
+      const buf = await resp.arrayBuffer();          // copy the bytes into memory before the cache entry is deleted
       const name = decodeURIComponent(resp.headers.get('X-File-Name') || 'audio');
-      files.push(new File([blob], name, { type: resp.headers.get('Content-Type') || blob.type }));
+      files.push(new File([buf], name, { type: resp.headers.get('Content-Type') || '' }));
       await cache.delete(req);
     }
     if (files.length) transcribe(sortFiles(files));
