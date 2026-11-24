@@ -230,10 +230,12 @@ async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = 
     signal?.removeEventListener('abort', onParentAbort);
   }
 }
-const TIMEOUT_MS = 45000;   // long voice messages need time; parallel racing covers slow models
+const TIMEOUT_MS = 30000;   // long voice messages need time; parallel racing covers slow models
 const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
 function badModels() { try { return JSON.parse(store.get('badModels', '[]')); } catch { return []; } }
+function coolMap() { try { return JSON.parse(store.get('cooldown', '{}')); } catch { return {}; } }
+function coolDown(m, minutes) { const c = coolMap(); c[m] = Date.now() + minutes * 60000; store.set('cooldown', JSON.stringify(c)); }
 function markBad(m) { const b = badModels(); if (!b.includes(m)) { b.push(m); store.set('badModels', JSON.stringify(b)); } }
 // Ask the API which models this key can use, so retired model names don't break the app.
 async function candidateModels(key, chosen) {
@@ -262,7 +264,10 @@ async function candidateModels(key, chosen) {
   if (!list.length) list = ['gemini-flash-latest', 'gemini-pro-latest'];
   const last = store.get('lastGoodModel', '');
   const bad = badModels();
-  return [...new Set([...manual, ...(last ? [last] : []), ...list])].filter(m => manual.includes(m) || !bad.includes(m));
+  const all = [...new Set([...manual, ...(last ? [last] : []), ...list])].filter(m => manual.includes(m) || !bad.includes(m));
+  const cool = coolMap(), now = Date.now();
+  const ready = all.filter(m => !(cool[m] > now));
+  return ready.length ? [...ready, ...all.filter(m => cool[m] > now)] : all;   // cooling models go last
 }
 
 async function transcribe(file) {
@@ -283,7 +288,7 @@ async function transcribe(file) {
     if (OLD_DEFAULTS.includes(chosen)) { chosen = DEFAULT_MODEL; store.set('model', chosen); }
     const models = await candidateModels(key, chosen);
     const isKeyError = e => e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message));
-    const busy = e => e.status === 429 || (e.status >= 500 && !e.timeout);
+    const busy = e => e.status >= 500 && !e.timeout;   // 429 = quota, retrying only wastes more quota
 
     // One model, with a single retry if the server says it's busy.
     const diag = [];
@@ -300,6 +305,7 @@ async function transcribe(file) {
         if (!e.cancelled) {
           diag.push(`${model} (${Math.round((Date.now() - ts) / 1000)}s): ${e.status ? e.status + ' ' : ''}${String(e.message).slice(0, 120)}`);
           if (/no longer available|not found|not supported|deprecated/i.test(e.message) && (e.status === 404 || e.status === 400)) markBad(model);
+          if (e.status === 429 || e.timeout) coolDown(model, e.status === 429 ? 15 : 5);
         }
         throw e;
       }
@@ -314,7 +320,8 @@ async function transcribe(file) {
     // Race the first two candidate models in parallel; take whichever answers first.
     const queue = [...models];
     while (!text && queue.length) {
-      const batch = queue.splice(0, queue.length === models.length ? 2 : 1);
+      const race = queue.length === models.length && !store.get('lastGoodModel', '');
+      const batch = queue.splice(0, race ? 2 : 1);
       showProgress(batch);
       const ctrl = new AbortController();
       try {
