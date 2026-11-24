@@ -27,7 +27,7 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .center { text-align:center; }
   .err { color:#b00020; }
-  .hidden { display:none; }
+  .hidden { display:none !important; }
   .muted { color:var(--muted); font-size:14px; line-height:1.5; }
   h2 { font-size:16px; color:var(--muted); margin:20px 4px 8px; }
   a { color:var(--green); }
@@ -45,7 +45,8 @@
     <input id="key" type="password" autocomplete="off" placeholder="AIza...">
     <p class="muted">מקבלים מפתח בחינם ב-<a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a>. המפתח נשמר רק בטלפון הזה.</p>
     <label for="model">מודל</label>
-    <input id="model" type="text">
+    <input id="model" type="text" placeholder="auto">
+    <p class="muted">auto = בחירה אוטומטית של המודל החדש ביותר. אין צורך לשנות.</p>
     <div class="row" style="margin-top:12px">
       <button class="btn" id="saveBtn">שמירה</button>
       <button class="btn light" id="closeBtn">סגירה</button>
@@ -58,7 +59,7 @@
     <div class="transcript" id="currentText"></div>
     <div class="meta">
       <span id="currentTime"></span>
-      <button class="btn light" id="copyBtn">העתקה</button>
+      <div class="row"><button class="btn light" id="copyBtn">העתקה</button><button class="btn light" id="delCurrent" aria-label="מחיקה">🗑</button></div>
     </div>
     <div class="muted" id="currentInfo" style="direction:ltr;font-size:11px;margin-top:6px"></div>
   </section>
@@ -75,13 +76,16 @@
     </div>
   </section>
 
-  <h2 id="histTitle" class="hidden">תמלולים קודמים</h2>
+  <div id="histTitle" class="hidden" style="display:flex;justify-content:space-between;align-items:center;margin:20px 4px 8px">
+    <h2 style="margin:0">תמלולים קודמים</h2>
+    <button class="btn light" id="clearAll" style="padding:6px 12px;font-size:14px">מחיקת הכל</button>
+  </div>
   <div id="history"></div>
 </main>
 
 <script>
-const DEFAULT_MODEL = 'gemini-2.5-flash';
-const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-pro'];
+const DEFAULT_MODEL = 'auto';   // auto = pick the newest available Flash model from the API's model list
+const OLD_DEFAULTS = ['gemini-flash-latest', 'gemini-2.5-flash', ''];
 const PROMPT = 'Transcribe this voice message word for word, in its original spoken language (usually Hebrew), using that language\'s own script. ' +
   'Do NOT translate and do NOT summarize. Add punctuation and paragraph breaks for readability. ' +
   'Output only the transcript, with no introduction or commentary. Even if the audio is quiet, noisy or unclear, transcribe whatever you can hear; ' +
@@ -109,6 +113,7 @@ $('closeBtn').onclick = () => $('settings').classList.add('hidden');
 $('saveBtn').onclick = () => {
   store.set('apiKey', $('key').value.trim());
   store.set('model', $('model').value.trim() || DEFAULT_MODEL);
+  store.set('modelList', '');
   $('settings').classList.add('hidden');
   if (pendingFile) { const f = pendingFile; pendingFile = null; transcribe(f); }
 };
@@ -128,9 +133,17 @@ function renderHistory(skipFirst) {
     const s = document.createElement('span'); s.textContent = fmt(item.ts);
     const b = document.createElement('button'); b.className = 'btn light'; b.textContent = 'העתקה';
     b.onclick = () => copy(item.text, b);
-    m.append(s, b); c.append(t, m); $('history').append(c);
+    const d = document.createElement('button'); d.className = 'btn light'; d.textContent = '🗑'; d.setAttribute('aria-label', 'מחיקה');
+    d.onclick = () => { deleteItem(item.ts); renderHistory(!$('current').classList.contains('hidden')); };
+    const g = document.createElement('div'); g.className = 'row'; g.append(b, d);
+    m.append(s, g); c.append(t, m); $('history').append(c);
   }
 }
+function deleteItem(ts) { saveHistory(loadHistory().filter(x => x.ts !== ts)); }
+$('clearAll').onclick = () => {
+  if (!confirm('למחוק את כל התמלולים?')) return;
+  saveHistory([]); $('current').classList.add('hidden'); renderHistory(false);
+};
 async function copy(text, btn) {
   try { await navigator.clipboard.writeText(text); btn.textContent = 'הועתק ✓'; setTimeout(() => btn.textContent = 'העתקה', 1500); } catch {}
 }
@@ -171,6 +184,34 @@ async function callGemini(model, key, mime, data) {
   return text;
 }
 
+// Ask the API which models this key can use, so retired model names don't break the app.
+async function candidateModels(key, chosen) {
+  const manual = chosen && chosen !== 'auto' ? [chosen] : [];
+  let list = [];
+  try {
+    const cached = JSON.parse(store.get('modelList', 'null'));
+    if (cached && Date.now() - cached.ts < 86400000) list = cached.list;
+  } catch {}
+  if (!list.length) {
+    try {
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', { headers: { 'x-goog-api-key': key } });
+      const j = await r.json();
+      const ver = n => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+      const ok = (j.models || [])
+        .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+        .map(m => m.name.replace(/^models\//, ''))
+        .filter(n => /^gemini-\d/.test(n) && /(flash|pro)/.test(n) &&
+                     !/(lite|image|tts|live|audio|embed|exp|computer|robotics|thinking|learnlm|customtools)/i.test(n));
+      const flash = ok.filter(n => n.includes('flash')).sort((a, b) => ver(b) - ver(a));
+      const pro   = ok.filter(n => n.includes('pro')).sort((a, b) => ver(b) - ver(a));
+      list = [...flash.slice(0, 3), 'gemini-flash-latest', ...pro.slice(0, 2)];
+      if (ok.length) store.set('modelList', JSON.stringify({ ts: Date.now(), list }));
+    } catch {}
+  }
+  if (!list.length) list = ['gemini-flash-latest', 'gemini-pro-latest'];
+  return [...new Set([...manual, ...list])];
+}
+
 async function transcribe(file) {
   $('current').classList.add('hidden');
   const key = store.get('apiKey', '');
@@ -186,9 +227,10 @@ async function transcribe(file) {
     if (file.size < 500) throw Object.assign(new Error(`file size ${file.size} bytes`), { status: -1 });
     const data = await toBase64(file);
     let chosen = store.get('model', DEFAULT_MODEL);
-    if (chosen === 'gemini-flash-latest') { chosen = DEFAULT_MODEL; store.set('model', chosen); } // old default
-    const models = [...new Set([chosen, ...FALLBACK_MODELS])];
-    const retryable = s => s === 404 || s === 429 || s >= 500 || !s;
+    if (OLD_DEFAULTS.includes(chosen)) { chosen = DEFAULT_MODEL; store.set('model', chosen); }
+    const models = await candidateModels(key, chosen);
+    const isKeyError = e => e.status === 401 || e.status === 403 || (e.status === 400 && /api key/i.test(e.message));
+    const busy = s => s === 429 || s >= 500;
     let text, lastErr, usedModel;
     outer:
     for (const model of models) {
@@ -196,11 +238,10 @@ async function transcribe(file) {
         try { text = await callGemini(model, key, mime, data); usedModel = model; break outer; }
         catch (e) {
           lastErr = e;
-          if (e.status === 400 || e.status === 401 || e.status === 403) throw e; // key / request problem
-          if (e.status === 404) break;            // model doesn't exist → next model
-          if (!retryable(e.status)) throw e;
+          if (isKeyError(e)) throw e;
+          if (!busy(e.status) || attempt === 1) break;   // unavailable model or still busy → next model
           status('<div class="spinner"></div>השרת עמוס, מנסה שוב...');
-          await new Promise(r => setTimeout(r, 2500 * (attempt + 1)));
+          await new Promise(r => setTimeout(r, 2500));
         }
       }
     }
@@ -228,6 +269,7 @@ function showCurrent(item) {
   $('currentInfo').textContent = item.info || '';
   $('current').classList.remove('hidden');
   $('copyBtn').onclick = () => copy(item.text, $('copyBtn'));
+  $('delCurrent').onclick = () => { deleteItem(item.ts); $('current').classList.add('hidden'); renderHistory(false); };
   renderHistory(true);
 }
 
