@@ -60,6 +60,7 @@
       <span id="currentTime"></span>
       <button class="btn light" id="copyBtn">העתקה</button>
     </div>
+    <div class="muted" id="currentInfo" style="direction:ltr;font-size:11px;margin-top:6px"></div>
   </section>
 
   <section id="welcome" class="card hidden">
@@ -79,11 +80,12 @@
 </main>
 
 <script>
-const DEFAULT_MODEL = 'gemini-flash-latest';
-const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-flash-lite-latest', 'gemini-2.5-flash-lite'];
+const DEFAULT_MODEL = 'gemini-2.5-flash';
+const FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-flash-latest', 'gemini-2.5-pro'];
 const PROMPT = 'Transcribe this voice message word for word, in its original spoken language (usually Hebrew), using that language\'s own script. ' +
   'Do NOT translate and do NOT summarize. Add punctuation and paragraph breaks for readability. ' +
-  'Output only the transcript, with no introduction or commentary. If there is no intelligible speech, output: [לא זוהה דיבור]';
+  'Output only the transcript, with no introduction or commentary. Even if the audio is quiet, noisy or unclear, transcribe whatever you can hear; ' +
+  'only if the audio is truly silent or contains no speech at all, output exactly: [לא זוהה דיבור]';
 
 const $ = id => document.getElementById(id);
 const store = {
@@ -181,28 +183,30 @@ async function transcribe(file) {
   status('<div class="spinner"></div>מתמלל...');
   try {
     const mime = guessMime(file, file.name);
+    if (file.size < 500) throw Object.assign(new Error(`file size ${file.size} bytes`), { status: -1 });
     const data = await toBase64(file);
-    const chosen = store.get('model', DEFAULT_MODEL);
+    let chosen = store.get('model', DEFAULT_MODEL);
+    if (chosen === 'gemini-flash-latest') { chosen = DEFAULT_MODEL; store.set('model', chosen); } // old default
     const models = [...new Set([chosen, ...FALLBACK_MODELS])];
     const retryable = s => s === 404 || s === 429 || s >= 500 || !s;
-    let text, lastErr;
+    let text, lastErr, usedModel;
     outer:
     for (const model of models) {
       for (let attempt = 0; attempt < 2; attempt++) {
-        try { text = await callGemini(model, key, mime, data); break outer; }
+        try { text = await callGemini(model, key, mime, data); usedModel = model; break outer; }
         catch (e) {
           lastErr = e;
           if (e.status === 400 || e.status === 401 || e.status === 403) throw e; // key / request problem
           if (e.status === 404) break;            // model doesn't exist → next model
           if (!retryable(e.status)) throw e;
           status('<div class="spinner"></div>השרת עמוס, מנסה שוב...');
-          await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+          await new Promise(r => setTimeout(r, 2500 * (attempt + 1)));
         }
       }
     }
     if (!text) throw lastErr;
     hideStatus();
-    const item = { text, ts: Date.now() };
+    const item = { text, ts: Date.now(), info: `${usedModel} · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
     showCurrent(item);
   } catch (e) {
@@ -211,6 +215,7 @@ async function transcribe(file) {
       (e.status === 400 && /api key/i.test(e.message)) || e.status === 401 || e.status === 403 ? 'בעיה במפתח ה-API. בדקו אותו בהגדרות (⚙️).' :
       e.status === 429 ? 'הגעתם למכסת השימוש החינמית לעכשיו. נסו שוב בעוד כמה דקות.' :
       e.status >= 500 ? 'השרתים של גוגל עמוסים כרגע. נסו שוב בעוד דקה.' :
+      e.status === -1 ? 'הקובץ שהתקבל מוואטסאפ ריק. נסו לשתף שוב.' :
       !e.status ? 'אין חיבור לאינטרנט, או שהבקשה נכשלה.' : 'התמלול נכשל.';
     status(`<div class="err">${friendly}</div><div class="muted" style="direction:ltr;margin-top:6px">${String(e.message).replace(/</g,'&lt;')}</div>
       <div class="row" style="justify-content:center;margin-top:10px"><button class="btn" id="retryBtn">נסה שוב</button></div>`);
@@ -220,6 +225,7 @@ async function transcribe(file) {
 function showCurrent(item) {
   $('currentText').textContent = item.text;
   $('currentTime').textContent = fmt(item.ts);
+  $('currentInfo').textContent = item.info || '';
   $('current').classList.remove('hidden');
   $('copyBtn').onclick = () => copy(item.text, $('copyBtn'));
   renderHistory(true);
