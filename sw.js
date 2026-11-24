@@ -1,5 +1,5 @@
 // Service worker: receives audio shared from WhatsApp and hands it to the page.
-const VERSION = 'v10';
+const VERSION = 'v15';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -20,10 +20,12 @@ self.addEventListener('fetch', e => {
   if (e.request.method === 'POST' && url.pathname.endsWith('/share-target')) {
     e.respondWith((async () => {
       const form = await e.request.formData();
-      const file = form.get('audio');
+      const files = form.getAll('audio').filter(f => f && f.size);   // one or several voice messages
       const cache = await caches.open('shared');
-      if (file && file.size) {
-        await cache.put('shared-audio', new Response(file, {
+      for (const k of await cache.keys()) await cache.delete(k);       // leftovers from an earlier share
+      let i = 0;
+      for (const file of files) {
+        await cache.put(`shared-audio-${i++}`, new Response(file, {
           headers: {
             'Content-Type': file.type || '',
             'X-File-Name': encodeURIComponent(file.name || 'audio')

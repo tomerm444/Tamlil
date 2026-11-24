@@ -34,6 +34,16 @@
   .titlebar { display:flex; align-items:center; gap:6px; margin-bottom:8px; font-size:15px; color:var(--green); }
   .titlebar b { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .icon { background:none; border:0; font-size:16px; padding:2px 6px; opacity:.7; }
+  .actions { display:flex; gap:6px; }
+  .actions .btn { padding:8px 11px; font-size:15px; }
+  .summary { background:#e7f3f1; border-radius:10px; padding:10px 12px; margin-bottom:10px; font-size:16px; line-height:1.5; }
+  .summary b { color:var(--green); }
+  audio { width:100%; margin-top:10px; }
+  .hl { background:#fff3c4; border-radius:5px; padding:0 3px; text-decoration:none; color:inherit; border-bottom:2px solid #f0c040; cursor:pointer; }
+  .hl.phone { background:#e3f0ff; border-bottom-color:#5b9bf0; }
+  .hl.ltr { direction:ltr; unicode-bidi:isolate; display:inline-block; }
+  mark { background:#ffe066; border-radius:3px; }
+  #search { width:100%; padding:10px 12px; font-size:16px; border:1px solid #ccd; border-radius:10px; margin-bottom:10px; background:#fff; }
 </style>
 </head>
 <body>
@@ -58,15 +68,7 @@
 
   <section id="status" class="card center hidden"></section>
 
-  <section id="current" class="card hidden">
-    <div class="titlebar"><b id="currentTitle"></b><button class="icon" id="renameCurrent" aria-label="שינוי שם">✏️</button></div>
-    <div class="transcript" id="currentText"></div>
-    <div class="meta">
-      <span id="currentTime"></span>
-      <div class="row"><button class="btn light" id="copyBtn">העתקה</button><button class="btn light" id="delCurrent" aria-label="מחיקה">🗑</button></div>
-    </div>
-    <div class="muted" id="currentInfo" style="direction:ltr;font-size:11px;margin-top:6px"></div>
-  </section>
+  <section id="current" class="hidden"></section>
 
   <section id="welcome" class="card hidden">
     <p class="muted">
@@ -75,7 +77,7 @@
     <div class="row">
       <label class="btn light" style="margin:0;font-weight:normal">
         בחירת קובץ שמע ידנית
-        <input type="file" id="filePick" accept="audio/*,.opus,.ogg,.m4a" class="hidden">
+        <input type="file" id="filePick" accept="audio/*,.opus,.ogg,.m4a" multiple class="hidden">
       </label>
     </div>
   </section>
@@ -84,6 +86,7 @@
     <h2 style="margin:0">תמלולים קודמים</h2>
     <button class="btn light" id="clearAll" style="padding:6px 12px;font-size:14px">מחיקת הכל</button>
   </div>
+  <input id="search" type="search" class="hidden" placeholder="🔍 חיפוש בתמלולים">
   <div id="history"></div>
 </main>
 
@@ -125,54 +128,217 @@ $('saveBtn').onclick = () => {
   store.set('modelList', '');
   store.set('badModels', '[]');
   $('settings').classList.add('hidden');
-  if (pendingFile) { const f = pendingFile; pendingFile = null; transcribe(f); }
+  if (pendingFiles) { const f = pendingFiles; pendingFiles = null; transcribe(f); }
 };
 
+// ---------- audio storage (IndexedDB, so the original recording can be replayed) ----------
+const idb = (() => {
+  let dbp;
+  const db = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('tamlil', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('audio');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  }));
+  const tx = async (mode, fn) => { const d = await db(); return new Promise((res, rej) => {
+    const t = d.transaction('audio', mode), s = t.objectStore('audio'), q = fn(s);
+    t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error);
+  }); };
+  return {
+    put: (k, v) => tx('readwrite', s => s.put(v, k)).catch(() => {}),
+    get: k => tx('readonly', s => s.get(k)).catch(() => null),
+    del: k => tx('readwrite', s => s.delete(k)).catch(() => {}),
+    keys: () => tx('readonly', s => s.getAllKeys()).catch(() => []),
+    clear: () => tx('readwrite', s => s.clear()).catch(() => {})
+  };
+})();
+
 // ---------- history ----------
+const MAX_HISTORY = 100;   // transcripts (text is tiny)
+const MAX_AUDIO = 15;      // recordings kept for replay
+const currentSet = new Set();   // transcripts shown in big cards at the top (one per shared message)
 function loadHistory() { try { return JSON.parse(store.get('history', '[]')); } catch { return []; } }
-function saveHistory(h) { store.set('history', JSON.stringify(h.slice(0, 15))); }
+function saveHistory(h) {
+  h = h.slice(0, MAX_HISTORY);
+  store.set('history', JSON.stringify(h));
+  const keep = new Set(h.slice(0, MAX_AUDIO).map(x => x.ts));   // drop recordings of older / removed transcripts
+  idb.keys().then(ks => ks.forEach(k => { if (!keep.has(k)) idb.del(k); }));
+}
+function updateItem(ts, patch) { saveHistory(loadHistory().map(x => x.ts === ts ? { ...x, ...patch } : x)); }
 function fmt(ts) { return new Date(ts).toLocaleString('he-IL', { dateStyle:'short', timeStyle:'short' }); }
-function renderHistory(skipFirst) {
-  const h = loadHistory().slice(skipFirst ? 1 : 0);
-  $('history').innerHTML = '';
-  $('histTitle').classList.toggle('hidden', !h.length);
-  for (const item of h) {
-    const c = document.createElement('div'); c.className = 'card';
-    const tb = document.createElement('div'); tb.className = 'titlebar';
-    const tt = document.createElement('b'); tt.textContent = titleOf(item);
-    const e = document.createElement('button'); e.className = 'icon'; e.textContent = '✏️'; e.setAttribute('aria-label', 'שינוי שם');
-    e.onclick = () => { if (renameItem(item)) tt.textContent = titleOf(item); };
-    tb.append(tt, e); c.append(tb);
-    const t = document.createElement('div'); t.className = 'transcript'; t.style.fontSize = '17px'; t.textContent = item.text;
-    const m = document.createElement('div'); m.className = 'meta';
-    const s = document.createElement('span'); s.textContent = fmt(item.ts);
-    const b = document.createElement('button'); b.className = 'btn light'; b.textContent = 'העתקה';
-    b.onclick = () => copy(item.text, b);
-    const d = document.createElement('button'); d.className = 'btn light'; d.textContent = '🗑'; d.setAttribute('aria-label', 'מחיקה');
-    d.onclick = () => { deleteItem(item.ts); renderHistory(!$('current').classList.contains('hidden')); };
-    const g = document.createElement('div'); g.className = 'row'; g.append(b, d);
-    m.append(s, g); c.append(t, m); $('history').append(c);
-  }
-}
 function titleOf(item) { return item.title || 'הודעה קולית'; }
-function renameItem(item) {
-  const name = prompt('שם לתמלול:', item.title || '');
-  if (name === null) return false;
-  item.title = name.trim();
-  saveHistory(loadHistory().map(x => x.ts === item.ts ? { ...x, title: item.title } : x));
-  return true;
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function btn(label, aria, onclick) { const b = el('button', 'btn light', label); if (aria) b.setAttribute('aria-label', aria); b.onclick = onclick; return b; }
+
+// ---------- highlighting of dates, times and phone numbers ----------
+const HEB = '֐-׿';
+const HOUR_WORDS = { 'אחת':1,'שתיים':2,'שתים':2,'שלוש':3,'ארבע':4,'חמש':5,'שש':6,'שבע':7,'שמונה':8,'תשע':9,'עשר':10,'אחת עשרה':11,'אחת-עשרה':11,'שתים עשרה':12,'שתים-עשרה':12 };
+const DAYS = { 'ראשון':0,'שני':1,'שלישי':2,'רביעי':3,'חמישי':4,'שישי':5,'שבת':6 };
+const hourAlt = Object.keys(HOUR_WORDS).sort((a, b) => b.length - a.length).join('|');
+const PART = '(?:\\s+(?:בבוקר|בצהריים|בצהרים|אחר הצהריים|אחה"צ|בערב|בלילה))?';
+const RICH = new RegExp(
+  `(?<url>https?:\\/\\/[^\\s]+)` +
+  `|(?<email>[\\w.+-]+@[\\w-]+\\.[\\w.]+)` +
+  `|(?<phone>(?:\\+972[-\\s]?|0)(?:5\\d|7\\d|[23489])[-\\s]?\\d{3}[-\\s]?\\d{4})` +
+  `|(?<time>(?<![\\d:])\\d{1,2}:\\d{2}(?![\\d:])${PART}|(?<![${HEB}]{2})בשעה\\s+(?:\\d{1,2}(?::\\d{2})?|${hourAlt})(?:\\s+וחצי|\\s+ורבע)?${PART})` +
+  `|(?<date>(?<![\\d./])\\d{1,2}[./]\\d{1,2}(?:[./]\\d{2,4})?(?![\\d./])|(?<![${HEB}]{2})(?:מחרתיים|מחר|היום)(?![${HEB}])|(?<![${HEB}])[ובלמ]?(?:יום\\s+(?:ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|שבת)(?![${HEB}]))`,
+  'g');
+
+function parseDate(s, base) {
+  const d = new Date(base); d.setHours(0, 0, 0, 0);
+  let m;
+  if ((m = s.match(/(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?/))) {
+    const r = new Date(d); r.setMonth(+m[2] - 1, +m[1]);
+    if (m[3]) r.setFullYear(m[3].length === 2 ? 2000 + +m[3] : +m[3]);
+    else if (r < d - 30 * 864e5) r.setFullYear(r.getFullYear() + 1);
+    return r;
+  }
+  if (/מחרתיים/.test(s)) { d.setDate(d.getDate() + 2); return d; }
+  if (/מחר/.test(s)) { d.setDate(d.getDate() + 1); return d; }
+  if (/היום/.test(s)) return d;
+  for (const [name, wd] of Object.entries(DAYS)) if (new RegExp(name + '$').test(s.trim())) {
+    let add = (wd - d.getDay() + 7) % 7; if (add === 0) add = 7;
+    d.setDate(d.getDate() + add); return d;
+  }
+  return null;
 }
-function deleteItem(ts) { saveHistory(loadHistory().filter(x => x.ts !== ts)); }
+function parseTime(s) {
+  let h, min = 0, m;
+  if ((m = s.match(/(\d{1,2})(?::(\d{2}))?/))) { h = +m[1]; min = +(m[2] || 0); }
+  else { const w = Object.keys(HOUR_WORDS).sort((a, b) => b.length - a.length).find(w => s.includes(w)); if (!w) return null; h = HOUR_WORDS[w]; }
+  if (/וחצי/.test(s)) min = 30; else if (/ורבע/.test(s)) min = 15;
+  const pm = /ערב|לילה|אחר הצהריים|אחה"צ/.test(s) || (/צהר/.test(s) && h < 6);
+  const am = /בוקר/.test(s);
+  if (h < 12 && (pm || (!am && !s.includes(':') && h >= 1 && h <= 7))) h += 12;   // "בשש" usually means 18:00
+  return h > 23 || min > 59 ? null : [h, min];
+}
+const pad = n => String(n).padStart(2, '0');
+const ymd = d => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;
+function calendarUrl(item, tapped) {
+  // Pair the tapped date/time with the nearest matching detail in the same message (within ~50 chars).
+  const toks = [...item.text.matchAll(RICH)].map(m => ({ ...m.groups, i: m.index, end: m.index + m[0].length }));
+  const near = (kind, from, to) => toks.filter(t => t[kind] && t.i >= from && t.i <= to)
+                                       .sort((a, b) => Math.abs(a.i - tapped.i) - Math.abs(b.i - tapped.i))[0]?.[kind];
+  const dateStr = tapped.date || near('date', tapped.i - 60, tapped.i);
+  const timeStr = tapped.time || near('time', tapped.i, tapped.i + 50);
+  const day = (dateStr && parseDate(dateStr, item.ts)) || parseDate('היום', item.ts);
+  const t = timeStr && parseTime(timeStr);
+  let dates;
+  if (t) {
+    const st = new Date(day); st.setHours(t[0], t[1]);
+    const en = new Date(st.getTime() + 3600e3);
+    const f = d => `${ymd(d)}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
+    dates = `${f(st)}/${f(en)}`;
+  } else { const n = new Date(day); n.setDate(n.getDate() + 1); dates = `${ymd(day)}/${ymd(n)}`; }
+  const title = item.title || item.summary || item.text.slice(0, 60);
+  return 'https://calendar.google.com/calendar/render?action=TEMPLATE' +
+    `&text=${encodeURIComponent(title)}&dates=${dates}&details=${encodeURIComponent(item.text.slice(0, 1500))}`;
+}
+// Builds text with highlighted details (and search matches) — never uses innerHTML for transcript text.
+function richText(container, text, item, q) {
+  const addPlain = s => {
+    if (!q) { container.append(s); return; }
+    const low = s.toLowerCase(), ql = q.toLowerCase(); let i = 0, j;
+    while ((j = low.indexOf(ql, i)) >= 0) { container.append(s.slice(i, j), el('mark', null, s.slice(j, j + q.length))); i = j + q.length; }
+    container.append(s.slice(i));
+  };
+  let last = 0;
+  for (const m of text.matchAll(RICH)) {
+    addPlain(text.slice(last, m.index)); last = m.index + m[0].length;
+    const g = m.groups, a = el('a', 'hl', m[0]);
+    if (g.phone || g.url || g.email || /^\d/.test(m[0])) a.classList.add('ltr');
+    if (g.phone) { a.classList.add('phone'); a.href = 'tel:' + g.phone.replace(/[-\s]/g, ''); }
+    else if (g.url) { a.href = g.url; a.target = '_blank'; a.rel = 'noopener'; }
+    else if (g.email) { a.href = 'mailto:' + g.email; }
+    else { a.href = '#'; a.title = 'הוספה ליומן';
+           a.onclick = ev => { ev.preventDefault(); window.open(calendarUrl(item, { date: g.date, time: g.time, i: m.index }), '_blank'); }; }
+    container.append(a);
+  }
+  addPlain(text.slice(last));
+}
+
+function buildCard(item, big, q) {
+  const c = el('div', 'card');
+  // title + rename
+  const tb = el('div', 'titlebar'), tt = el('b');
+  const setTitle = () => { tt.innerHTML = ''; richText(tt, titleOf(item), { ...item, text: '' }, q); };
+  setTitle();
+  const ren = el('button', 'icon', '✏️'); ren.setAttribute('aria-label', 'שינוי שם');
+  ren.onclick = () => {
+    const name = prompt('שם לתמלול:', item.title || '');
+    if (name === null) return;
+    item.title = name.trim(); updateItem(item.ts, { title: item.title }); setTitle();
+  };
+  tb.append(tt, ren); c.append(tb);
+  // summary (long messages)
+  const sum = el('div', 'summary hidden'); c.append(sum);
+  const setSummary = s => { sum.innerHTML = ''; if (s) { sum.append(el('b', null, 'בקיצור: ')); richText(sum, s, item, q); sum.classList.remove('hidden'); } };
+  setSummary(item.summary);
+  c._setSummary = setSummary;
+  // transcript
+  const t = el('div', 'transcript'); richText(t, item.text, item, q); if (!big) t.style.fontSize = '17px'; c.append(t);
+  const player = el('div'); c.append(player);
+  // actions
+  const m = el('div', 'meta'); m.append(el('span', null, fmt(item.ts)));
+  const a = el('div', 'actions');
+  const play = btn('▶️', 'השמעה', async () => {
+    if (player.firstChild) { player.innerHTML = ''; return; }
+    const blob = await idb.get(item.ts);
+    if (!blob) { play.textContent = '—'; play.disabled = true; return; }
+    const au = el('audio'); au.controls = true; au.src = URL.createObjectURL(blob);
+    player.append(au); au.play().catch(() => {});
+  });
+  idb.get(item.ts).then(b => { if (!b) play.classList.add('hidden'); });
+  const share = btn('📤', 'שיתוף', async () => {
+    const text = (item.summary ? 'בקיצור: ' + item.summary + '\n\n' : '') + item.text;
+    if (navigator.share) { try { await navigator.share({ text }); } catch {} } else copy(text, share);
+  });
+  const cp = btn('📋', 'העתקה', () => copy(item.text, cp));
+  const del = btn('🗑', 'מחיקה', () => {
+    saveHistory(loadHistory().filter(x => x.ts !== item.ts)); idb.del(item.ts);
+    if (currentSet.delete(item.ts)) { c.remove(); if (!$('current').children.length) $('current').classList.add('hidden'); }
+    renderHistory();
+  });
+  a.append(play, share, cp, del); m.append(a); c.append(m);
+  if (big && item.info) { const i = el('div', 'muted', item.info); i.style.cssText = 'direction:ltr;font-size:11px;margin-top:6px'; c.append(i); }
+  return c;
+}
+function renderHistory() {
+  const all = loadHistory();
+  const q = $('search').value.trim();
+  $('search').classList.toggle('hidden', all.length < 2 && !q);
+  $('history').innerHTML = '';
+  if (q) {                                   // search mode: look through everything, current card included
+    $('current').classList.add('hidden');
+    const ql = q.toLowerCase();
+    const hits = all.filter(x => [x.text, x.title, x.summary].some(s => s && s.toLowerCase().includes(ql)));
+    $('histTitle').classList.add('hidden');
+    if (!hits.length) $('history').append(Object.assign(el('div', 'muted center', 'לא נמצאו תמלולים')));
+    for (const item of hits) $('history').append(buildCard(item, false, q));
+    return;
+  }
+  if ($('current').children.length) $('current').classList.remove('hidden');
+  const h = all.filter(x => !currentSet.has(x.ts));
+  $('histTitle').classList.toggle('hidden', !h.length);
+  for (const item of h) $('history').append(buildCard(item, false));
+}
+$('search').oninput = () => renderHistory();
+function placeCard(item, replace) {
+  currentSet.add(item.ts);
+  const card = buildCard(item, true);
+  if (replace && replace.isConnected) replace.replaceWith(card); else $('current').append(card);
+  $('current').classList.remove('hidden');
+  renderHistory();
+  return card;
+}
 $('clearAll').onclick = () => {
   if (!confirm('למחוק את כל התמלולים?')) return;
-  saveHistory([]); $('current').classList.add('hidden'); renderHistory(false);
+  saveHistory([]); idb.clear(); currentSet.clear(); $('current').innerHTML = ''; $('current').classList.add('hidden'); renderHistory();
 };
-async function copy(text, btn) {
-  try { await navigator.clipboard.writeText(text); btn.textContent = 'הועתק ✓'; setTimeout(() => btn.textContent = 'העתקה', 1500); } catch {}
+async function copy(text, b) {
+  try { await navigator.clipboard.writeText(text); const old = b.textContent; b.textContent = '✓'; setTimeout(() => b.textContent = old, 1500); } catch {}
 }
 
 // ---------- transcription ----------
-let pendingFile = null;
 
 function status(html) { $('status').innerHTML = html; $('status').classList.remove('hidden'); }
 function hideStatus() { $('status').classList.add('hidden'); }
@@ -191,17 +357,19 @@ function toBase64(blob) {
     r.readAsDataURL(blob);
   });
 }
-async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = true, signal } = {}) {
+// Streaming call: onText(fullTextSoFar) is called as words arrive.
+async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = true, signal, onText } = {}) {
   const gen = {};
   if (/gemini-3/.test(model)) { if (thinking) gen.thinkingConfig = { thinkingLevel: 'minimal' }; }  // fastest
   else gen.temperature = 0;
   const ctrl = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, TIMEOUT_MS);
+  let timedOut = false, timer;
+  const arm = ms => { clearTimeout(timer); timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, ms); };
   const onParentAbort = () => ctrl.abort();
   signal?.addEventListener('abort', onParentAbort);
+  arm(TIMEOUT_MS);                                   // time allowed until the first words arrive
   try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
       signal: ctrl.signal,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
@@ -211,18 +379,36 @@ async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = 
         generationConfig: gen
       })
     });
-    const j = await r.json();
     if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
       if (r.status === 400 && thinking && gen.thinkingConfig && /think/i.test(j.error?.message || ''))
-        return await callGemini(model, key, mime, data, { prompt, thinking: false, signal });
+        return await callGemini(model, key, mime, data, { prompt, thinking: false, signal, onText });
       throw Object.assign(new Error(j.error?.message || ('HTTP ' + r.status)), { status: r.status });
     }
-    const text = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
-    if (!text) throw new Error('empty response (' + (j.candidates?.[0]?.finishReason || 'unknown') + ')');
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '', text = '', finish = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+        if (j.error) throw Object.assign(new Error(j.error.message || 'stream error'), { status: j.error.code });
+        const c = j.candidates?.[0];
+        if (c?.finishReason) finish = c.finishReason;
+        const piece = (c?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+        if (piece) { text += piece; arm(STALL_MS); onText?.(text); }   // keep going while words flow
+      }
+    }
+    text = text.trim();
+    if (!text) throw new Error('empty response (' + (finish || 'unknown') + ')');
     return text;
   } catch (err) {
     if (err.name === 'AbortError')
-      throw Object.assign(new Error(timedOut ? `timeout after ${TIMEOUT_MS/1000}s (${model})` : 'cancelled'),
+      throw Object.assign(new Error(timedOut ? `timeout (${model})` : 'cancelled'),
                           { status: timedOut ? 504 : 0, timeout: timedOut, cancelled: !timedOut });
     throw err;
   } finally {
@@ -230,7 +416,27 @@ async function callGemini(model, key, mime, data, { prompt = PROMPT, thinking = 
     signal?.removeEventListener('abort', onParentAbort);
   }
 }
-const TIMEOUT_MS = 30000;   // long voice messages need time; parallel racing covers slow models
+const TIMEOUT_MS = 25000;   // max wait for the first words
+const STALL_MS = 20000;     // max silence between words once streaming
+// WhatsApp names voice notes like PTT-20261124-WA0012.opus → name order = the order they were sent.
+function sortFiles(fs) { return fs.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })); }
+const SUMMARY_MIN_CHARS = 450;   // about 45+ seconds of speech
+async function summarize(text, model, key) {
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'סכם בעברית, במשפט אחד או שניים קצרים, את עיקר ההודעה הבאה: מה רוצים ממני, מה חשוב, תאריכים ושעות אם יש. ' +
+          'כתוב רק את הסיכום, בלי הקדמה.\n\n' + text }] }],
+        generationConfig: /gemini-3/.test(model) ? { thinkingConfig: { thinkingLevel: 'minimal' } } : { temperature: 0 }
+      })
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim() || null;
+  } catch { return null; }
+}
 const hasHebrew = s => /[\u0590-\u05FF]/.test(s);
 
 function badModels() { try { return JSON.parse(store.get('badModels', '[]')); } catch { return []; } }
@@ -270,17 +476,11 @@ async function candidateModels(key, chosen) {
   return ready.length ? [...ready, ...all.filter(m => cool[m] > now)] : all;   // cooling models go last
 }
 
-async function transcribe(file) {
-  $('current').classList.add('hidden');
+// Transcribes one recording into its own card; throws on failure (handled by transcribe()).
+async function transcribeOne(file, label) {
   const key = store.get('apiKey', '');
-  if (!key) {
-    pendingFile = file;
-    status('צריך להגדיר מפתח API פעם אחת, ואז התמלול יתחיל.');
-    openSettings();
-    return;
-  }
-  status('<div class="spinner"></div>מתמלל...');
-  try {
+  status(`<div class="spinner"></div>${label}מתמלל...`);
+  {
     const mime = guessMime(file, file.name);
     if (file.size < 500) throw Object.assign(new Error(`file size ${file.size} bytes`), { status: -1 });
     const data = await toBase64(file);
@@ -292,14 +492,14 @@ async function transcribe(file) {
 
     // One model, with a single retry if the server says it's busy.
     const diag = [];
-    async function runModel(model, signal) {
+    async function runModel(model, signal, onText) {
       const ts = Date.now();
       try {
-        try { return await callGemini(model, key, mime, data, { signal }); }
+        try { return await callGemini(model, key, mime, data, { signal, onText }); }
         catch (e) {
           if (!busy(e) || signal?.aborted) throw e;
           await new Promise(r => setTimeout(r, 2000));
-          return await callGemini(model, key, mime, data, { signal });
+          return await callGemini(model, key, mime, data, { signal, onText });
         }
       } catch (e) {
         if (!e.cancelled) {
@@ -312,87 +512,128 @@ async function transcribe(file) {
     }
 
     const t0 = Date.now();
-    const showProgress = names => status(`<div class="spinner"></div>מתמלל... <span id="secs">${Math.round((Date.now() - t0) / 1000)}</span> שנ׳<div class="muted" style="direction:ltr">${names.join(' / ')}</div>`);
+    const showProgress = names => status(`<div class="spinner"></div>${label}מתמלל... <span id="secs">${Math.round((Date.now() - t0) / 1000)}</span> שנ׳<div class="muted" style="direction:ltr">${names.join(' / ')}</div>`);
     clearInterval(window._tick);
     window._tick = setInterval(() => { const s = $('secs'); if (s) s.textContent = Math.round((Date.now() - t0) / 1000); }, 1000);
 
     let text, lastErr, usedModel;
-    // Race the first two candidate models in parallel; take whichever answers first.
+    // Live view of the transcript while it streams in.
+    let liveText = null, liveCard = null;
+    const live = t => {
+      hideStatus();
+      if (!liveText) {
+        liveCard = el('div', 'card'); liveCard.append(el('div', 'titlebar'));
+        liveCard.firstChild.append(el('b', null, (label ? label.replace(/: $/, ' · ') : '') + 'מתמלל...'));
+        liveText = el('div', 'transcript'); liveCard.append(liveText);
+        $('current').append(liveCard); $('current').classList.remove('hidden');
+      }
+      liveText.textContent = t;
+    };
+    const unlive = () => { liveCard?.remove(); liveText = liveCard = null; if (!$('current').children.length) $('current').classList.add('hidden'); };
+
+    // Race the first two candidates; the first one to start writing wins, the other is cancelled.
     const queue = [...models];
     while (!text && queue.length) {
       const race = queue.length === models.length && !store.get('lastGoodModel', '');
       const batch = queue.splice(0, race ? 2 : 1);
       showProgress(batch);
-      const ctrl = new AbortController();
+      const ctrls = batch.map(() => new AbortController());
+      let winner = null;
       try {
-        [text, usedModel] = await Promise.any(batch.map(m => runModel(m, ctrl.signal).then(t => [t, m])));
-        ctrl.abort();                                    // cancel the slower request
+        [text, usedModel] = await Promise.any(batch.map((m, i) =>
+          runModel(m, ctrls[i].signal, t => {
+            if (!winner) { winner = m; ctrls.forEach((c, k) => k !== i && c.abort()); }
+            if (winner === m) live(t);
+          }).then(t => [t, m])));
       } catch (agg) {
+        unlive();
         const errs = (agg.errors || [agg]).filter(e => !e.cancelled);
         const keyErr = errs.find(isKeyError);
         if (keyErr) throw keyErr;
         lastErr = errs[errs.length - 1] || lastErr;
         if (batch.includes(store.get('lastGoodModel', ''))) store.set('lastGoodModel', '');
+        if (queue.length) showProgress([queue[0]]);
       }
     }
     if (text) {
       store.set('lastGoodModel', usedModel);
       if (!hasHebrew(text) && /[a-z]{3}/i.test(text)) {    // came back in English → ask again in Hebrew
+        unlive();
         status('<div class="spinner"></div>מוודא שהתמליל בעברית...');
-        try { text = await callGemini(usedModel, key, mime, data, { prompt: RETRY_PROMPT }); } catch {}
+        try { text = await callGemini(usedModel, key, mime, data, { prompt: RETRY_PROMPT, onText: live }); } catch {}
       }
     }
+    const secs = Math.round((Date.now() - t0) / 1000);
     clearInterval(window._tick);
     if (!text) { if (lastErr) lastErr.diag = diag; throw lastErr || new Error('no models'); }
     hideStatus();
-    const item = { text, ts: Date.now(), info: `${usedModel} · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
+    if (!liveCard) live(text);                       // (in case nothing streamed)
+    const item = { text, ts: Math.max(Date.now(), (loadHistory()[0]?.ts || 0) + 1), info: `${usedModel} · ${secs}s · ${file.name} · ${mime} (${file.type || 'no type'}) · ${Math.round(file.size/1024)}KB` };
     const h = loadHistory(); h.unshift(item); saveHistory(h);
-    showCurrent(item);
-  } catch (e) {
-    clearInterval(window._tick);
-    pendingFile = file;
-    const friendly =
-      (e.status === 400 && /api key/i.test(e.message)) || e.status === 401 || e.status === 403 ? 'בעיה במפתח ה-API. בדקו אותו בהגדרות (⚙️).' :
-      e.status === 429 ? 'הגעתם למכסת השימוש החינמית לעכשיו. נסו שוב בעוד כמה דקות.' :
-      e.status >= 500 ? 'השרתים של גוגל עמוסים כרגע. נסו שוב בעוד דקה.' :
-      e.status === -1 ? 'הקובץ שהתקבל מוואטסאפ ריק. נסו לשתף שוב.' :
-      !e.status ? 'אין חיבור לאינטרנט, או שהבקשה נכשלה.' : 'התמלול נכשל.';
-    status(`<div class="err">${friendly}</div><div class="muted" style="direction:ltr;text-align:left;margin-top:6px;font-size:12px">${(e.diag && e.diag.length ? e.diag : [String(e.message)]).map(s => s.replace(/</g,'&lt;')).join('<br>')}</div>
-      <div class="row" style="justify-content:center;margin-top:10px"><button class="btn" id="retryBtn">נסה שוב</button></div>`);
-    $('retryBtn').onclick = () => { const f = pendingFile; pendingFile = null; transcribe(f); };
+    await idb.put(item.ts, file);
+    const card = placeCard(item, liveCard);
+    if (text.length > SUMMARY_MIN_CHARS) {
+      summarize(text, usedModel, key).then(s => {
+        if (!s) return;
+        item.summary = s; updateItem(item.ts, { summary: s });
+        if (card.isConnected) card._setSummary(s);
+      });
+    }
   }
 }
-function showCurrent(item) {
-  $('currentText').textContent = item.text;
-  $('currentTitle').textContent = titleOf(item);
-  $('renameCurrent').onclick = () => { if (renameItem(item)) $('currentTitle').textContent = titleOf(item); };
-  $('currentTime').textContent = fmt(item.ts);
-  $('currentInfo').textContent = item.info || '';
-  $('current').classList.remove('hidden');
-  $('copyBtn').onclick = () => copy(item.text, $('copyBtn'));
-  $('delCurrent').onclick = () => { deleteItem(item.ts); $('current').classList.add('hidden'); renderHistory(false); };
-  renderHistory(true);
-}
 
-$('filePick').onchange = e => { const f = e.target.files[0]; if (f) transcribe(f); e.target.value = ''; };
+// Transcribes one or more recordings in order (several voice messages can be shared at once).
+let pendingFiles = null;
+async function transcribe(files, keep = false) {
+  files = [...files];
+  if (!keep) { currentSet.clear(); $('current').innerHTML = ''; $('current').classList.add('hidden'); }
+  if ($('search').value) { $('search').value = ''; }
+  renderHistory();
+  if (!store.get('apiKey', '')) {
+    pendingFiles = files;
+    status('צריך להגדיר מפתח API פעם אחת, ואז התמלול יתחיל.');
+    openSettings();
+    return;
+  }
+  for (let i = 0; i < files.length; i++) {
+    const label = files.length > 1 ? `הודעה ${i + 1} מתוך ${files.length}: ` : '';
+    try { await transcribeOne(files[i], label); }
+    catch (e) {
+      clearInterval(window._tick);
+      pendingFiles = files.slice(i);
+      const friendly =
+        (e.status === 400 && /api key/i.test(e.message)) || e.status === 401 || e.status === 403 ? 'בעיה במפתח ה-API. בדקו אותו בהגדרות (⚙️).' :
+        e.status === 429 ? 'הגעתם למכסת השימוש החינמית לעכשיו. נסו שוב בעוד כמה דקות.' :
+        e.status >= 500 ? 'השרתים של גוגל עמוסים כרגע. נסו שוב בעוד דקה.' :
+        e.status === -1 ? 'הקובץ שהתקבל מוואטסאפ ריק. נסו לשתף שוב.' :
+        !e.status ? 'אין חיבור לאינטרנט, או שהבקשה נכשלה.' : 'התמלול נכשל.';
+      const left = files.length > 1 ? `<div class="muted">${label}${files.length - i > 1 ? `(נשארו ${files.length - i} הודעות)` : ''}</div>` : '';
+      status(`<div class="err">${friendly}</div>${left}<div class="muted" style="direction:ltr;text-align:left;margin-top:6px;font-size:12px">${(e.diag && e.diag.length ? e.diag : [String(e.message)]).map(s => s.replace(/</g,'&lt;')).join('<br>')}</div>
+        <div class="row" style="justify-content:center;margin-top:10px"><button class="btn" id="retryBtn">נסה שוב</button></div>`);
+      $('retryBtn').onclick = () => { const f = pendingFiles; pendingFiles = null; transcribe(f, true); };   // keep the ones already done
+      return;
+    }
+  }
+}
+$('filePick').onchange = e => { const fs = [...e.target.files]; if (fs.length) transcribe(sortFiles(fs)); e.target.value = ''; };
 
 // ---------- startup ----------
 (async () => {
   $('welcome').classList.remove('hidden');
-  renderHistory(false);
+  renderHistory();
   if (new URLSearchParams(location.search).get('shared')) {
     history.replaceState(null, '', './');
     const cache = await caches.open('shared');
-    const resp = await cache.match('shared-audio');
-    if (resp) {
-      await cache.delete('shared-audio');
+    const files = [];
+    for (const req of await cache.keys()) {
+      const resp = await cache.match(req);
       const blob = await resp.blob();
       const name = decodeURIComponent(resp.headers.get('X-File-Name') || 'audio');
-      const file = new File([blob], name, { type: resp.headers.get('Content-Type') || blob.type });
-      transcribe(file);
-    } else {
-      status('<div class="err">לא התקבל קובץ שמע. נסו לשתף שוב.</div>');
+      files.push(new File([blob], name, { type: resp.headers.get('Content-Type') || blob.type }));
+      await cache.delete(req);
     }
+    if (files.length) transcribe(sortFiles(files));
+    else status('<div class="err">לא התקבל קובץ שמע. נסו לשתף שוב.</div>');
   } else if (!store.get('apiKey', '')) {
     openSettings();
   }
